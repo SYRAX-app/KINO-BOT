@@ -1,0 +1,449 @@
+import telebot
+from telebot import types
+
+import config
+import database as db
+from keep_alive import keep_alive
+
+bot = telebot.TeleBot(config.BOT_TOKEN)
+db.init_db()
+
+# Adminning hozirgi holatini saqlab turish uchun
+admin_state = {}   # {admin_id: {"action": "...", "file_id": "..."}}
+
+
+# ================= YORDAMCHI FUNKSIYALAR =================
+
+def is_admin(user_id):
+    return user_id == config.ADMIN_ID
+
+
+def check_subscription(user_id):
+    """Foydalanuvchi barcha majburiy kanal/botlarni bajarganmi tekshiradi.
+    Faqat kanallar tekshiriladi, botlar tekshirilmaydi."""
+    channels = db.get_channels()
+    not_done = []
+    
+    for channel_id, title, type_ in channels:
+        type_ = type_ or "channel"
+        if type_ == "channel":
+            try:
+                member = bot.get_chat_member(channel_id, user_id)
+                if member.status in ["left", "kicked"]:
+                    not_done.append((channel_id, title, type_))
+            except Exception:
+                # Bot o'sha kanalda admin bo'lmasa yoki kanal noto'g'ri kiritilgan bo'lsa
+                not_done.append((channel_id, title, type_))
+        # type_ == "bot" - TEKSHIRILMAYDI, o'tkazib yuboramiz
+        # (faqat ro'yxatda ko'rinadi, lekin tekshirilmaydi)
+    
+    return not_done
+
+
+def subscription_keyboard(not_done):
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    
+    # Barcha obuna punktlarini ko'rsatish (kanallar ham, botlar ham)
+    all_items = db.get_channels()
+    
+    # Raqamlash uchun indeks
+    idx = 1
+    for channel_id, title, type_ in all_items:
+        type_ = type_ or "channel"
+        display_title = title or channel_id
+        if len(display_title) > 30:
+            display_title = display_title[:27] + "..."
+        
+        # Kanal uchun havola
+        if type_ == "channel":
+            username = str(channel_id).lstrip('@')
+            url = f"https://t.me/{username}"
+            icon = "📢"
+        else:  # bot
+            username = str(channel_id).lstrip('@')
+            url = f"https://t.me/{username}"
+            icon = "🤖"
+        
+        # Tugma matni: raqam + nom
+        button_text = f"{idx}. {icon} {display_title}"
+        markup.add(types.InlineKeyboardButton(button_text, url=url))
+        idx += 1
+    
+    markup.add(types.InlineKeyboardButton("✅ Tekshirish", callback_data="check_sub"))
+    return markup
+
+
+def admin_main_menu():
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        types.InlineKeyboardButton("📊 Statistika", callback_data="adm_stats"),
+        types.InlineKeyboardButton("📢 Majburiy obuna", callback_data="adm_channels"),
+        types.InlineKeyboardButton("🎬 Kinolar", callback_data="adm_videos"),
+    )
+    return markup
+
+
+# ================= FOYDALANUVCHI QISMI =================
+
+@bot.message_handler(commands=['start'])
+def start_handler(message):
+    db.add_user(message.from_user.id)
+    
+    # Foydalanuvchi ismini olish
+    user = message.from_user
+    first_name = user.first_name or "Foydalanuvchi"
+    
+    not_done = check_subscription(message.from_user.id)
+    if not_done:
+        bot.send_message(
+            message.chat.id,
+            f"👋 Dalom {first_name} botimizga xush kelibsiz.\n\n"
+            "Botdan foydalanish uchun quyidagi kanallarga a'zo bo'ling, "
+            "so'ng \"✅ Tekshirish\" tugmasini bosing:",
+            reply_markup=subscription_keyboard(not_done),
+        )
+        return
+    
+    bot.send_message(
+        message.chat.id,
+        f"👋 Dalom {first_name} botimizga xush kelibsiz.\n\n"
+        "✍🏻 Kino kodini yuboring.\n"
+        "Masalan: 130-677",
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "check_sub")
+def check_sub_callback(call):
+    not_done = check_subscription(call.from_user.id)
+    if not_done:
+        bot.answer_callback_query(call.id, "❌ Siz hali barcha kanallarga a'zo bo'lmadingiz!", show_alert=True)
+        return
+    
+    bot.answer_callback_query(call.id, "✅ Tasdiqlandi!")
+    
+    user = call.from_user
+    first_name = user.first_name or "Foydalanuvchi"
+    
+    bot.edit_message_text(
+        f"✅ Tasdiqlandi!\n\n"
+        f"👋 Dalom {first_name} botimizga xush kelibsiz.\n\n"
+        f"✍🏻 Kino kodini yuboring.\n"
+        f"Masalan: 130-677",
+        call.message.chat.id,
+        call.message.message_id,
+    )
+
+
+# ================= ADMIN PANEL =================
+
+@bot.message_handler(commands=['admin'])
+def admin_handler(message):
+    if not is_admin(message.from_user.id):
+        return
+    admin_state.pop(message.from_user.id, None)
+    bot.send_message(message.chat.id, "🔧 Admin panel", reply_markup=admin_main_menu())
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "adm_back")
+def adm_back(call):
+    if not is_admin(call.from_user.id):
+        return
+    admin_state.pop(call.from_user.id, None)
+    bot.edit_message_text("🔧 Admin panel", call.message.chat.id, call.message.message_id, reply_markup=admin_main_menu())
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "adm_stats")
+def adm_stats(call):
+    if not is_admin(call.from_user.id):
+        return
+    users = db.get_users_count()
+    videos = db.get_videos_count()
+    requests_count = db.get_requests_count()
+    text = (
+        "📊 Statistika\n\n"
+        f"👤 Foydalanuvchilar soni: {users}\n"
+        f"🎬 Kinolar soni: {videos}\n"
+        f"📥 Kod so'rovlari soni: {requests_count}"
+    )
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("⬅️ Orqaga", callback_data="adm_back"))
+    bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "adm_channels")
+def adm_channels(call):
+    if not is_admin(call.from_user.id):
+        return
+    channels = db.get_channels()
+    text = "📢 Majburiy obuna ro'yxati:\n\n"
+    if channels:
+        for idx, (cid, title, type_) in enumerate(channels, 1):
+            icon = "📢" if (type_ or "channel") == "channel" else "🤖"
+            display_title = title or cid
+            text += f"{idx}. {icon} {display_title}\n"
+    else:
+        text += "Hozircha hech narsa qo'shilmagan."
+    
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        types.InlineKeyboardButton("➕ Kanal qo'shish", callback_data="adm_addchannel_channel"),
+        types.InlineKeyboardButton("➕ Bot qo'shish", callback_data="adm_addchannel_bot"),
+        types.InlineKeyboardButton("➖ O'chirish", callback_data="adm_delchannel"),
+        types.InlineKeyboardButton("⬅️ Orqaga", callback_data="adm_back"),
+    )
+    bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup)
+
+
+@bot.callback_query_handler(func=lambda call: call.data in ("adm_addchannel_channel", "adm_addchannel_bot"))
+def adm_addchannel(call):
+    if not is_admin(call.from_user.id):
+        return
+    type_ = "channel" if call.data == "adm_addchannel_channel" else "bot"
+    admin_state[call.from_user.id] = {"action": "waiting_channel_add", "type": type_}
+    bot.answer_callback_query(call.id)
+    if type_ == "channel":
+        bot.send_message(
+            call.message.chat.id,
+            "📢 Kanal username'ini yuboring (masalan: @mychannel).\n\n"
+            "⚠️ Diqqat: bot o'sha kanalda ADMIN bo'lishi shart, aks holda obunani tekshira olmaydi.",
+        )
+    else:
+        bot.send_message(
+            call.message.chat.id,
+            "🤖 Bot username'ini yuboring (masalan: @boshqabot).\n\n"
+            "ℹ️ Bot faqat ro'yxatda ko'rinadi, a'zolik tekshirilmaydi.",
+        )
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "adm_delchannel")
+def adm_delchannel(call):
+    if not is_admin(call.from_user.id):
+        return
+    channels = db.get_channels()
+    if not channels:
+        bot.answer_callback_query(call.id, "Ro'yxat bo'sh", show_alert=True)
+        return
+    
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    for idx, (cid, title, type_) in enumerate(channels, 1):
+        icon = "📢" if (type_ or "channel") == "channel" else "🤖"
+        display_title = title or cid
+        if len(display_title) > 25:
+            display_title = display_title[:22] + "..."
+        markup.add(types.InlineKeyboardButton(
+            f"❌ {idx}. {icon} {display_title}", 
+            callback_data=f"delch_{cid}"
+        ))
+    markup.add(types.InlineKeyboardButton("⬅️ Orqaga", callback_data="adm_channels"))
+    bot.answer_callback_query(call.id)
+    bot.edit_message_text(
+        "O'chirmoqchi bo'lgan punktni tanlang:", 
+        call.message.chat.id, 
+        call.message.message_id, 
+        reply_markup=markup
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("delch_"))
+def delch_callback(call):
+    if not is_admin(call.from_user.id):
+        return
+    channel_id = call.data.replace("delch_", "", 1)
+    db.remove_channel(channel_id)
+    bot.answer_callback_query(call.id, "✅ O'chirildi")
+    adm_channels(call)
+
+
+# ---------- Kinolar menyusi ----------
+
+@bot.callback_query_handler(func=lambda call: call.data == "adm_videos")
+def adm_videos(call):
+    if not is_admin(call.from_user.id):
+        return
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        types.InlineKeyboardButton("➕ Kino qo'shish", callback_data="adm_addvideo"),
+        types.InlineKeyboardButton("🗑 Kino o'chirish", callback_data="adm_delvideo"),
+        types.InlineKeyboardButton("📋 Kinolar ro'yxati", callback_data="adm_listvideos"),
+        types.InlineKeyboardButton("⬅️ Orqaga", callback_data="adm_back"),
+    )
+    bot.edit_message_text("🎬 Kinolar bo'limi", call.message.chat.id, call.message.message_id, reply_markup=markup)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "adm_addvideo")
+def adm_addvideo(call):
+    if not is_admin(call.from_user.id):
+        return
+    admin_state[call.from_user.id] = {"action": "waiting_video"}
+    bot.answer_callback_query(call.id)
+    bot.send_message(call.message.chat.id, "🎬 Kino faylini yuboring (video sifatida).")
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "adm_listvideos")
+def adm_listvideos(call):
+    if not is_admin(call.from_user.id):
+        return
+    codes = db.get_all_video_codes()
+    if codes:
+        text = "📋 Kinolar ro'yxati:\n\n" + "\n".join(f"• {c}" for c in codes[:100])
+        if len(codes) > 100:
+            text += f"\n\n... va yana {len(codes) - 100} ta"
+    else:
+        text = "Hozircha kino qo'shilmagan."
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("⬅️ Orqaga", callback_data="adm_videos"))
+    bot.answer_callback_query(call.id)
+    bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "adm_delvideo")
+def adm_delvideo(call):
+    if not is_admin(call.from_user.id):
+        return
+    admin_state[call.from_user.id] = {"action": "waiting_delete_code"}
+    bot.answer_callback_query(call.id)
+    bot.send_message(call.message.chat.id, "🗑 O'chirmoqchi bo'lgan kinoning kodini yuboring (masalan: 130-677):")
+
+
+@bot.message_handler(
+    func=lambda m: is_admin(m.from_user.id)
+    and admin_state.get(m.from_user.id, {}).get("action") == "waiting_delete_code"
+)
+def process_delete_video(message):
+    code = message.text.strip()
+    admin_state.pop(message.from_user.id, None)
+    if db.delete_video(code):
+        bot.send_message(message.chat.id, f"✅ '{code}' kodidagi kino o'chirildi.", reply_markup=admin_main_menu())
+    else:
+        bot.send_message(message.chat.id, f"❌ '{code}' kodi topilmadi.", reply_markup=admin_main_menu())
+
+
+# ================= ADMIN INPUT (matn / video) =================
+
+@bot.message_handler(
+    func=lambda m: is_admin(m.from_user.id)
+    and admin_state.get(m.from_user.id, {}).get("action") == "waiting_channel_add"
+)
+def process_add_channel(message):
+    channel_id = message.text.strip()
+    type_ = admin_state[message.from_user.id].get("type", "channel")
+    title = channel_id
+    
+    try:
+        chat = bot.get_chat(channel_id)
+        title = chat.title or channel_id
+    except Exception:
+        pass
+    
+    db.add_channel(channel_id, title, type_)
+    admin_state.pop(message.from_user.id, None)
+    label = "Kanal" if type_ == "channel" else "Bot"
+    bot.send_message(message.chat.id, f"✅ {label} qo'shildi: {title}", reply_markup=admin_main_menu())
+
+
+@bot.message_handler(
+    content_types=['video', 'document'],
+    func=lambda m: is_admin(m.from_user.id)
+    and admin_state.get(m.from_user.id, {}).get("action") == "waiting_video",
+)
+def process_add_video(message):
+    file_id = message.video.file_id if message.video else message.document.file_id
+    admin_state[message.from_user.id] = {"action": "waiting_video_code", "file_id": file_id}
+    bot.send_message(message.chat.id, "🔢 Endi shu kino uchun kod kiriting (masalan: 130-677):")
+
+
+@bot.message_handler(
+    func=lambda m: is_admin(m.from_user.id)
+    and admin_state.get(m.from_user.id, {}).get("action") == "waiting_video_code"
+)
+def process_video_code(message):
+    code = message.text.strip()
+    admin_state[message.from_user.id]["code"] = code
+    admin_state[message.from_user.id]["action"] = "waiting_video_caption"
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("➡️ O'tkazib yuborish", callback_data="skip_caption"))
+    bot.send_message(
+        message.chat.id,
+        "✏️ Endi kino tagiga chiqadigan matnni (caption) yuboring.\n"
+        "Masalan: nomi, yili, tavsifi va h.k.\n\n"
+        "Agar matn kerak bo'lmasa, pastdagi tugmani bosing.",
+        reply_markup=markup,
+    )
+
+
+def save_video_with_caption(user_id, chat_id, caption):
+    state = admin_state.get(user_id, {})
+    code = state.get("code")
+    file_id = state.get("file_id")
+    already_existed = db.code_exists(code)
+    db.add_video(code, file_id, caption)
+    if already_existed:
+        text = f"♻️ '{code}' kodi allaqachon mavjud edi, kino yangilandi."
+    else:
+        text = f"✅ Kino '{code}' kodi bilan saqlandi!"
+    admin_state.pop(user_id, None)
+    bot.send_message(chat_id, text, reply_markup=admin_main_menu())
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "skip_caption")
+def skip_caption_callback(call):
+    if not is_admin(call.from_user.id):
+        return
+    if admin_state.get(call.from_user.id, {}).get("action") != "waiting_video_caption":
+        return
+    bot.answer_callback_query(call.id)
+    save_video_with_caption(call.from_user.id, call.message.chat.id, "")
+
+
+@bot.message_handler(
+    func=lambda m: is_admin(m.from_user.id)
+    and admin_state.get(m.from_user.id, {}).get("action") == "waiting_video_caption"
+)
+def process_video_caption(message):
+    caption = message.text.strip()
+    save_video_with_caption(message.from_user.id, message.chat.id, caption)
+
+
+# ================= FOYDALANUVCHI: KOD SO'ROVI =================
+
+@bot.message_handler(func=lambda m: True, content_types=['text'])
+def code_request_handler(message):
+    # /start va /admin buyruqlarini qayta ishlamaslik uchun
+    if message.text.startswith('/'):
+        return
+    
+    db.add_user(message.from_user.id)
+    
+    not_done = check_subscription(message.from_user.id)
+    if not_done:
+        user = message.from_user
+        first_name = user.first_name or "Foydalanuvchi"
+        
+        bot.send_message(
+            message.chat.id,
+            f"👋 Dalom {first_name} botimizga xush kelibsiz.\n\n"
+            "Botdan foydalanish uchun quyidagi kanallarga a'zo bo'ling, "
+            "so'ng \"✅ Tekshirish\" tugmasini bosing:",
+            reply_markup=subscription_keyboard(not_done),
+        )
+        return
+
+    code = message.text.strip()
+    result = db.get_video(code)
+    if result:
+        file_id, caption = result
+        db.log_request(message.from_user.id, code)
+        try:
+            bot.send_video(message.chat.id, file_id, caption=caption or None, protect_content=True)
+        except Exception:
+            bot.send_document(message.chat.id, file_id, caption=caption or None, protect_content=True)
+    else:
+        bot.send_message(message.chat.id, "❌ Bunday kod topilmadi. Kodni tekshirib qaytadan yuboring.")
+
+
+# ================= ISHGA TUSHIRISH =================
+
+if __name__ == "__main__":
+    keep_alive()
+    print("Bot ishga tushdi...")
+    bot.infinity_polling(skip_pending=True)
