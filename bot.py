@@ -9,6 +9,11 @@ from keep_alive import keep_alive
 bot = telebot.TeleBot(config.BOT_TOKEN)
 db.init_db()
 
+# Env dagi boshlang'ich adminlarni bazaga yozish (bir marta / har start)
+for _aid in getattr(config, "SEED_ADMIN_IDS", []) or ([config.ADMIN_ID] if config.ADMIN_ID else []):
+    if _aid:
+        db.add_admin(int(_aid), added_by=None)
+
 # Adminning hozirgi holatini saqlab turish uchun
 admin_state = {}   # {admin_id: {"action": "...", "file_id": "..."}}
 
@@ -16,7 +21,11 @@ admin_state = {}   # {admin_id: {"action": "...", "file_id": "..."}}
 # ================= YORDAMCHI FUNKSIYALAR =================
 
 def is_admin(user_id):
-    return user_id == config.ADMIN_ID
+    try:
+        return db.is_admin_db(int(user_id))
+    except Exception:
+        return False
+
 
 
 def check_subscription(user_id):
@@ -91,8 +100,10 @@ def admin_main_menu():
         types.InlineKeyboardButton("📊 Statistika", callback_data="adm_stats"),
         types.InlineKeyboardButton("📢 Majburiy obuna", callback_data="adm_channels"),
         types.InlineKeyboardButton("🎬 Kinolar", callback_data="adm_videos"),
+        types.InlineKeyboardButton("👤 Adminlar", callback_data="adm_admins"),
     )
     return markup
+
 
 
 # ================= FOYDALANUVCHI QISMI =================
@@ -196,8 +207,98 @@ def adm_stats(call):
     bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup)
 
 
+# ---------- Adminlar boshqaruvi ----------
+@bot.callback_query_handler(func=lambda call: call.data == "adm_admins")
+def adm_admins(call):
+    if not is_admin(call.from_user.id):
+        return
+    admins = db.get_admins()
+    text = "👤 Adminlar ro'yxati:\n\n"
+    if admins:
+        for i, (uid, added_by, added_at) in enumerate(admins, 1):
+            text += f"{i}. <code>{uid}</code>\n"
+    else:
+        text += "Hozircha admin yo'q.\n"
+    text += (
+        "\n➕ Yangi admin qo'shish: uning Telegram ID sini yuboring "
+        "(@userinfobot orqali olish mumkin).\n"
+        "➖ O'chirish: pastdagi tugmadan tanlang."
+    )
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(types.InlineKeyboardButton("➕ Admin qo'shish", callback_data="adm_add_admin"))
+    if admins:
+        markup.add(types.InlineKeyboardButton("➖ Admin o'chirish", callback_data="adm_del_admin"))
+    markup.add(types.InlineKeyboardButton("⬅️ Orqaga", callback_data="adm_back"))
+    bot.edit_message_text(
+        text, call.message.chat.id, call.message.message_id,
+        reply_markup=markup, parse_mode="HTML",
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "adm_add_admin")
+def adm_add_admin(call):
+    if not is_admin(call.from_user.id):
+        return
+    admin_state[call.from_user.id] = {"action": "waiting_admin_id"}
+    bot.answer_callback_query(call.id)
+    bot.send_message(
+        call.message.chat.id,
+        "👤 Yangi adminning Telegram ID raqamini yuboring "
+        "(faqat raqam, masalan: 123456789).\n\n"
+        "ID ni bilish: @userinfobot → /start",
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "adm_del_admin")
+def adm_del_admin(call):
+    if not is_admin(call.from_user.id):
+        return
+    admins = db.get_admins()
+    if not admins:
+        bot.answer_callback_query(call.id, "Ro'yxat bo'sh", show_alert=True)
+        return
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    for uid, _, _ in admins:
+        label = f"🗑 {uid}"
+        if uid == call.from_user.id:
+            label += " (siz)"
+        markup.add(types.InlineKeyboardButton(label, callback_data=f"adm_rmadmin_{uid}"))
+    markup.add(types.InlineKeyboardButton("⬅️ Orqaga", callback_data="adm_admins"))
+    bot.edit_message_text(
+        "O'chirmoqchi bo'lgan adminni tanlang:\n"
+        "(oxirgi adminni o'chirib bo'lmaydi)",
+        call.message.chat.id, call.message.message_id, reply_markup=markup,
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data and call.data.startswith("adm_rmadmin_"))
+def adm_rmadmin_confirm(call):
+    if not is_admin(call.from_user.id):
+        return
+    try:
+        target = int(call.data.replace("adm_rmadmin_", ""))
+    except ValueError:
+        bot.answer_callback_query(call.id, "Xato ID", show_alert=True)
+        return
+    if db.admins_count() <= 1:
+        bot.answer_callback_query(call.id, "Oxirgi adminni o'chirib bo'lmaydi!", show_alert=True)
+        return
+    if target == call.from_user.id and db.admins_count() <= 1:
+        bot.answer_callback_query(call.id, "O'zingizni o'chira olmaysiz (yagona admin).", show_alert=True)
+        return
+    ok = db.remove_admin(target)
+    if ok:
+        bot.answer_callback_query(call.id, f"Admin o'chirildi: {target}", show_alert=True)
+    else:
+        bot.answer_callback_query(call.id, "Topilmadi", show_alert=True)
+    # Ro'yxatni yangilash
+    call.data = "adm_admins"
+    adm_admins(call)
+
+
 @bot.callback_query_handler(func=lambda call: call.data == "adm_channels")
 def adm_channels(call):
+
     if not is_admin(call.from_user.id):
         return
     channels = db.get_channels()
@@ -338,6 +439,47 @@ def adm_delvideo(call):
 
 @bot.message_handler(
     func=lambda m: is_admin(m.from_user.id)
+    and admin_state.get(m.from_user.id, {}).get("action") == "waiting_admin_id"
+)
+def process_add_admin_id(message):
+    admin_state.pop(message.from_user.id, None)
+    raw = (message.text or "").strip().replace(" ", "")
+    if not raw.isdigit():
+        bot.send_message(
+            message.chat.id,
+            "❌ Faqat raqam yuboring (Telegram ID).\nMasalan: 123456789",
+            reply_markup=admin_main_menu(),
+        )
+        return
+    new_id = int(raw)
+    if db.is_admin_db(new_id):
+        bot.send_message(
+            message.chat.id,
+            f"ℹ️ Bu ID allaqachon admin: <code>{new_id}</code>",
+            parse_mode="HTML",
+            reply_markup=admin_main_menu(),
+        )
+        return
+    db.add_admin(new_id, added_by=message.from_user.id)
+    bot.send_message(
+        message.chat.id,
+        f"✅ Yangi admin qo'shildi: <code>{new_id}</code>\n\n"
+        f"U endi /admin buyrug'ini ishlatishi mumkin.",
+        parse_mode="HTML",
+        reply_markup=admin_main_menu(),
+    )
+    try:
+        bot.send_message(
+            new_id,
+            "🎉 Sizga ushbu botda admin huquqi berildi.\n"
+            "Panelni ochish: /admin",
+        )
+    except Exception:
+        pass
+
+
+@bot.message_handler(
+    func=lambda m: is_admin(m.from_user.id)
     and admin_state.get(m.from_user.id, {}).get("action") == "waiting_delete_code"
 )
 def process_delete_video(message):
@@ -347,6 +489,7 @@ def process_delete_video(message):
         bot.send_message(message.chat.id, f"✅ '{code}' kodidagi kino o'chirildi.", reply_markup=admin_main_menu())
     else:
         bot.send_message(message.chat.id, f"❌ '{code}' kodi topilmadi.", reply_markup=admin_main_menu())
+
 
 
 # ================= ADMIN INPUT (matn / video) =================

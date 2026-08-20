@@ -67,8 +67,72 @@ def init_db():
                 PRIMARY KEY (user_id, channel_id)
             )
         """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS admins (
+                user_id INTEGER PRIMARY KEY,
+                added_by INTEGER,
+                added_at TEXT
+            )
+        """)
         conn.commit()
         conn.close()
+
+
+# ---------- admins ----------
+def add_admin(user_id, added_by=None):
+    with lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT OR IGNORE INTO admins (user_id, added_by, added_at) VALUES (?, ?, datetime('now'))",
+            (int(user_id), int(added_by) if added_by else None),
+        )
+        conn.commit()
+        changed = cur.rowcount > 0
+        conn.close()
+        return changed
+
+
+def remove_admin(user_id):
+    with lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM admins WHERE user_id = ?", (int(user_id),))
+        deleted = cur.rowcount > 0
+        conn.commit()
+        conn.close()
+        return deleted
+
+
+def get_admins():
+    with lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT user_id, added_by, added_at FROM admins ORDER BY added_at ASC")
+        rows = cur.fetchall()
+        conn.close()
+        return rows
+
+
+def is_admin_db(user_id):
+    with lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM admins WHERE user_id = ?", (int(user_id),))
+        row = cur.fetchone()
+        conn.close()
+        return row is not None
+
+
+def admins_count():
+    with lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM admins")
+        n = cur.fetchone()[0]
+        conn.close()
+        return n
+
 
 
 # ---------- users ----------
